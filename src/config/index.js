@@ -17,6 +17,7 @@ const config = {
 
   // Database configuration
   db: {
+    url: process.env.DATABASE_URL || null,
     host: process.env.DB_HOST || 'localhost',
     port: parseInt(process.env.DB_PORT, 10) || 3306,
     user: process.env.DB_USER || 'root',
