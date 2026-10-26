@@ -576,7 +576,7 @@ const getOrders = async (req, res, next) => {
         },
         {
           model: OrderItem,
-          as: 'items',
+          as: 'orderItems',
         },
         {
           model: Subscription,
@@ -607,7 +607,7 @@ const getOrderById = async (req, res, next) => {
         },
         {
           model: OrderItem,
-          as: 'items',
+          as: 'orderItems',
         },
         {
           model: Subscription,
@@ -734,7 +734,7 @@ const getCustomers = async (req, res, next) => {
   try {
     const ownerId = req.user.id;
 
-    // Fetch distinct customers who have ordered or subscribed from this owner
+    // 1. Fetch distinct customers who subscribed with this owner
     const subscriptions = await Subscription.findAll({
       where: { owner_id: ownerId },
       include: [
@@ -752,7 +752,110 @@ const getCustomers = async (req, res, next) => {
       order: [['created_at', 'DESC']],
     });
 
-    return res.status(200).json(successResponse(subscriptions, 'Customers list retrieved'));
+    // 2. Fetch distinct customers who placed orders with this owner
+    const orders = await Order.findAll({
+      where: { owner_id: ownerId },
+      include: [
+        {
+          model: User,
+          as: 'customer',
+          attributes: ['id', 'name', 'phone', 'email'],
+          include: [{ model: CustomerProfile, as: 'customerProfile' }],
+        },
+      ],
+      order: [['created_at', 'DESC']],
+    });
+
+    // Build unique customer map
+    const customerMap = new Map();
+
+    for (const sub of subscriptions) {
+      if (sub.customer && !customerMap.has(sub.customer.id)) {
+        customerMap.set(sub.customer.id, {
+          user: sub.customer,
+          plan: sub.plan,
+          subscription: sub,
+        });
+      }
+    }
+
+    for (const ord of orders) {
+      if (ord.customer && !customerMap.has(ord.customer.id)) {
+        customerMap.set(ord.customer.id, {
+          user: ord.customer,
+          plan: null,
+          subscription: null,
+        });
+      }
+    }
+
+    // Fallback: If no order/subscription customers found, get registered customers
+    if (customerMap.size === 0) {
+      const allCustomers = await User.findAll({
+        where: { role: 'customer', is_active: true },
+        attributes: ['id', 'name', 'phone', 'email'],
+        include: [{ model: CustomerProfile, as: 'customerProfile' }],
+        limit: 20,
+      });
+      for (const cust of allCustomers) {
+        customerMap.set(cust.id, {
+          user: cust,
+          plan: null,
+          subscription: null,
+        });
+      }
+    }
+
+    // Calculate pending amounts for each customer
+    const result = [];
+    for (const [custId, { user, plan, subscription }] of customerMap.entries()) {
+      const pendingOrders = await Order.findAll({
+        where: {
+          customer_id: custId,
+          owner_id: ownerId,
+          payment_status: 'pending',
+          order_status: { [Op.ne]: 'cancelled' },
+        },
+        attributes: ['id', 'total_amount'],
+      });
+      const pendingOrdersAmount = pendingOrders.reduce(
+        (sum, o) => sum + parseFloat(o.total_amount || 0),
+        0
+      );
+
+      let pendingSubAmount = 0;
+      if (subscription && subscription.status === 'active') {
+        pendingSubAmount = Math.max(
+          0,
+          parseFloat(subscription.total_amount || 0) - parseFloat(subscription.paid_amount || 0)
+        );
+      }
+
+      const totalPending = pendingOrdersAmount + pendingSubAmount;
+
+      result.push({
+        id: custId,
+        customer_id: custId,
+        name: user.name || user.phone || 'Customer',
+        phone: user.phone,
+        email: user.email,
+        customer: {
+          id: user.id,
+          name: user.name || user.phone || 'Customer',
+          phone: user.phone,
+          email: user.email,
+          customerProfile: user.customerProfile,
+        },
+        plan: plan || null,
+        subscription: subscription || null,
+        pending_orders_count: pendingOrders.length,
+        pending_orders_amount: pendingOrdersAmount,
+        pending_sub_amount: pendingSubAmount,
+        total_pending: totalPending,
+      });
+    }
+
+    return res.status(200).json(successResponse(result, 'Customers list retrieved'));
   } catch (error) {
     next(error);
   }
@@ -911,6 +1014,23 @@ const recordPayment = async (req, res, next) => {
     // If linked to order and paid, mark order as paid
     if (order_id && payment_status === 'paid') {
       await Order.update({ payment_status: 'paid' }, { where: { id: order_id } });
+    } else if (!order_id && payment_status === 'paid') {
+      // Auto-link and mark the oldest pending order for this customer as paid
+      const oldestPendingOrder = await Order.findOne({
+        where: {
+          customer_id,
+          owner_id: req.user.id,
+          payment_status: 'pending',
+          order_status: { [Op.ne]: 'cancelled' },
+        },
+        order: [['created_at', 'ASC']],
+      });
+      if (oldestPendingOrder) {
+        oldestPendingOrder.payment_status = 'paid';
+        await oldestPendingOrder.save();
+        payment.order_id = oldestPendingOrder.id;
+        await payment.save();
+      }
     }
 
     // If linked to subscription, increment paid_amount
@@ -968,12 +1088,35 @@ const getPaymentSummary = async (req, res, next) => {
     });
     const onlineCollections = parseFloat(onlineResult[0]?.getDataValue('total') || 0);
 
-    // Total outstanding / pending
-    const pendingResult = await Payment.findAll({
+    // Outstanding / pending from Orders
+    const pendingOrdersResult = await Order.findAll({
+      where: {
+        owner_id: ownerId,
+        payment_status: 'pending',
+        order_status: { [Op.ne]: 'cancelled' },
+      },
+      attributes: [[sequelize.fn('SUM', sequelize.col('total_amount')), 'total']],
+    });
+    const pendingOrdersTotal = parseFloat(pendingOrdersResult[0]?.getDataValue('total') || 0);
+
+    // Outstanding / pending from Subscriptions
+    const activeSubs = await Subscription.findAll({
+      where: { owner_id: ownerId, status: 'active' },
+      attributes: ['total_amount', 'paid_amount'],
+    });
+    const pendingSubsTotal = activeSubs.reduce((sum, sub) => {
+      const remaining = Math.max(0, parseFloat(sub.total_amount || 0) - parseFloat(sub.paid_amount || 0));
+      return sum + remaining;
+    }, 0);
+
+    // Outstanding recorded in Payments table
+    const pendingPaymentsResult = await Payment.findAll({
       where: { owner_id: ownerId, payment_status: 'pending' },
       attributes: [[sequelize.fn('SUM', sequelize.col('amount')), 'total']],
     });
-    const pendingCollections = parseFloat(pendingResult[0]?.getDataValue('total') || 0);
+    const pendingPaymentsTotal = parseFloat(pendingPaymentsResult[0]?.getDataValue('total') || 0);
+
+    const pendingCollections = pendingOrdersTotal + pendingSubsTotal + pendingPaymentsTotal;
 
     return res.status(200).json(
       successResponse(
@@ -982,6 +1125,8 @@ const getPaymentSummary = async (req, res, next) => {
           cashCollections,
           onlineCollections,
           pendingCollections,
+          pendingOrdersTotal,
+          pendingSubsTotal,
           totalRevenue: cashCollections + onlineCollections,
         },
         'Payment summary retrieved'

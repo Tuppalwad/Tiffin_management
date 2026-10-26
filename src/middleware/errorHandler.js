@@ -41,14 +41,12 @@ const errorHandler = (err, req, res, next) => {
   err.statusCode = err.statusCode || 500;
   err.status = err.status || 'error';
 
-  // Log error in development
-  if (process.env.NODE_ENV === 'development') {
-    console.error('ERROR:', {
-      message: err.message,
-      statusCode: err.statusCode,
-      stack: err.stack,
-    });
-  }
+  // Always log error to console for debugging
+  console.error('ERROR OCCURRED:', {
+    message: err.message,
+    statusCode: err.statusCode,
+    stack: err.stack,
+  });
 
   // Handle specific Sequelize errors
   if (err.name === 'SequelizeValidationError') {

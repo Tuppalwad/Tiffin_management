@@ -310,16 +310,22 @@ const createOrder = async (req, res, next) => {
 
     await t.commit();
 
-    const createdOrder = await Order.findByPk(order.id, {
-      include: [
-        { model: OrderItem, as: 'items' },
-        { model: User, as: 'owner', attributes: ['id', 'name', 'phone'] },
-      ],
-    });
+    let createdOrder = order;
+    try {
+      const fetched = await Order.findByPk(order.id, {
+        include: [
+          { model: OrderItem, as: 'orderItems' },
+          { model: User, as: 'owner', attributes: ['id', 'name', 'phone'] },
+        ],
+      });
+      if (fetched) createdOrder = fetched;
+    } catch (fetchErr) {
+      console.warn('Warning: Could not fetch associations for created order:', fetchErr.message);
+    }
 
     return res.status(201).json(successResponse(createdOrder, 'Order placed successfully', 201));
   } catch (error) {
-    await t.rollback();
+    if (!t.finished) await t.rollback();
     next(error);
   }
 };
@@ -345,7 +351,7 @@ const getCustomerOrders = async (req, res, next) => {
           attributes: ['id', 'name', 'phone'],
           include: [{ model: OwnerProfile, as: 'ownerProfile' }],
         },
-        { model: OrderItem, as: 'items' },
+        { model: OrderItem, as: 'orderItems' },
         {
           model: Subscription,
           as: 'subscription',
@@ -373,7 +379,7 @@ const getCustomerOrderById = async (req, res, next) => {
           attributes: ['id', 'name', 'phone'],
           include: [{ model: OwnerProfile, as: 'ownerProfile' }],
         },
-        { model: OrderItem, as: 'items' },
+        { model: OrderItem, as: 'orderItems' },
       ],
     });
 
